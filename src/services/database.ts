@@ -1,5 +1,27 @@
 import { supabase, Student, Attendance } from '../lib/supabase';
 
+// --- Local Fallback Helpers ---
+const getLocalStudents = (): Student[] => {
+  try {
+    return JSON.parse(localStorage.getItem('mock_students') || '[]');
+  } catch { return []; }
+};
+
+const saveLocalStudents = (students: Student[]) => {
+  localStorage.setItem('mock_students', JSON.stringify(students));
+};
+
+const getLocalAttendance = (): Attendance[] => {
+  try {
+    return JSON.parse(localStorage.getItem('mock_attendance') || '[]');
+  } catch { return []; }
+};
+
+const saveLocalAttendance = (attendance: Attendance[]) => {
+  localStorage.setItem('mock_attendance', JSON.stringify(attendance));
+};
+// -----------------------------
+
 export async function registerStudent(
   studentId: string,
   name: string,
@@ -10,14 +32,25 @@ export async function registerStudent(
   extraFields: { department?: string; mobile_no?: string; dob?: string; tutor?: string } = {}
 ): Promise<Student | null> {
   const payload: any = {
+    id: crypto.randomUUID(),
     student_id: studentId,
     name,
     email,
     photo_url: photoUrl,
     face_descriptor: faceDescriptor ? JSON.stringify(Array.from(faceDescriptor)) : null,
     role,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
     ...extraFields
   };
+
+  if (!supabase) {
+    console.log('Mock: Registering student locally');
+    const students = getLocalStudents();
+    students.push(payload);
+    saveLocalStudents(students);
+    return payload;
+  }
 
   const { data, error } = await supabase
     .from('students')
@@ -25,46 +58,28 @@ export async function registerStudent(
     .select()
     .maybeSingle();
 
-
   if (error) {
-    if (error.code === 'PGRST204' || error.code === '42703') {
-      console.warn('Schema mismatch: Some columns (like role) are missing in DB. Attempting minimal insert...');
-      // Try minimal insert
-      const minimalPayload = {
-        student_id: studentId,
-        name,
-        email,
-        photo_url: photoUrl,
-        face_descriptor: faceDescriptor ? JSON.stringify(Array.from(faceDescriptor)) : null,
-      };
-      const { data: minData, error: minError } = await supabase
-        .from('students')
-        .insert(minimalPayload)
-        .select()
-        .maybeSingle();
-      
-      if (minError) {
-        console.error('Minimal insert also failed:', minError);
-        return null;
-      }
-      return { ...minData, role }; // Return with requested role anyway
-    }
-    console.error('Error registering student:', error);
-    return null;
+    console.warn('Supabase Error, falling back to Local Storage:', error.message);
+    const students = getLocalStudents();
+    students.push(payload);
+    saveLocalStudents(students);
+    return payload;
   }
 
   return data;
 }
 
 export async function getAllStudents(): Promise<Student[]> {
+  if (!supabase) return getLocalStudents();
+
   const { data, error } = await supabase
     .from('students')
     .select('*')
     .order('created_at', { ascending: false });
 
   if (error) {
-    console.error('Error fetching students:', error);
-    return [];
+    console.warn('Supabase Error, fetching from Local Storage');
+    return getLocalStudents();
   }
 
   return data || [];
@@ -74,19 +89,33 @@ export async function recordAttendance(
   studentId: string,
   confidence: number
 ): Promise<Attendance | null> {
+  const payload: any = {
+    id: crypto.randomUUID(),
+    student_id: studentId,
+    confidence,
+    check_in_time: new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+
+  if (!supabase) {
+    const attendance = getLocalAttendance();
+    attendance.push(payload);
+    saveLocalAttendance(attendance);
+    return payload;
+  }
+
   const { data, error } = await supabase
     .from('attendance')
-    .insert({
-      student_id: studentId,
-      confidence,
-      check_in_time: new Date().toISOString(),
-    })
+    .insert(payload)
     .select()
     .maybeSingle();
 
   if (error) {
-    console.error('Error recording attendance:', error);
-    return null;
+    console.warn('Supabase Error, recording attendance locally');
+    const attendance = getLocalAttendance();
+    attendance.push(payload);
+    saveLocalAttendance(attendance);
+    return payload;
   }
 
   return data;
@@ -95,6 +124,13 @@ export async function recordAttendance(
 export async function getTodayStudentAttendance(studentId: string): Promise<Attendance | null> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+
+  if (!supabase) {
+    return getLocalAttendance().find(a => 
+      a.student_id === studentId && 
+      new Date(a.check_in_time) >= today
+    ) || null;
+  }
 
   const { data, error } = await supabase
     .from('attendance')
@@ -106,19 +142,10 @@ export async function getTodayStudentAttendance(studentId: string): Promise<Atte
     .maybeSingle();
 
   if (error) {
-    console.error('Error fetching today student attendance:', error);
-    return null;
-  }
-
-  if (data) {
-    try {
-      const cache = JSON.parse(localStorage.getItem('checkout_cache') || '{}');
-      if (cache[data.id]) {
-        Object.assign(data, cache[data.id]);
-      }
-    } catch (e) {
-      console.warn("Local cache overlay failed", e);
-    }
+    return getLocalAttendance().find(a => 
+      a.student_id === studentId && 
+      new Date(a.check_in_time) >= today
+    ) || null;
   }
 
   return data;
@@ -129,50 +156,61 @@ export async function markCheckOut(
   reason?: string,
   isEmergency: boolean = false
 ): Promise<boolean> {
-  const payload = {
+  const updates = {
     check_out_time: new Date().toISOString(),
     exit_reason: reason,
     is_emergency_exit: isEmergency
   };
 
+  if (!supabase) {
+    const attendance = getLocalAttendance();
+    const idx = attendance.findIndex(a => a.id === attendanceId);
+    if (idx !== -1) {
+      attendance[idx] = { ...attendance[idx], ...updates };
+      saveLocalAttendance(attendance);
+      return true;
+    }
+    return false;
+  }
+
   const { error } = await supabase
     .from('attendance')
-    .update(payload)
+    .update(updates)
     .eq('id', attendanceId);
 
   if (error) {
-    console.warn('Supabase missing checkout schema. Falling back to local device overlay:', error);
-    try {
-      const cache = JSON.parse(localStorage.getItem('checkout_cache') || '{}');
-      cache[attendanceId] = payload;
-      localStorage.setItem('checkout_cache', JSON.stringify(cache));
+    const attendance = getLocalAttendance();
+    const idx = attendance.findIndex(a => a.id === attendanceId);
+    if (idx !== -1) {
+      attendance[idx] = { ...attendance[idx], ...updates };
+      saveLocalAttendance(attendance);
       return true;
-    } catch (e) {
-      return false;
     }
+    return false;
   }
   return true;
 }
 
-
 export async function getAttendanceRecords(): Promise<(Attendance & { students: Student })[]> {
+  const students = await getAllStudents();
+  
+  if (!supabase) {
+    return getLocalAttendance().map(a => ({
+      ...a,
+      students: students.find(s => s.id === a.student_id || s.student_id === a.student_id)!
+    })).filter(a => a.students);
+  }
+
   const { data, error } = await supabase
     .from('attendance')
     .select('*, students(*)')
     .order('check_in_time', { ascending: false });
 
   if (error) {
-    console.error('Error fetching attendance:', error);
-    return [];
-  }
-
-  if (data) {
-    try {
-      const cache = JSON.parse(localStorage.getItem('checkout_cache') || '{}');
-      data.forEach(d => {
-        if (cache[d.id]) Object.assign(d, cache[d.id]);
-      });
-    } catch {}
+    return getLocalAttendance().map(a => ({
+      ...a,
+      students: students.find(s => s.id === a.student_id || s.student_id === a.student_id)!
+    })).filter(a => a.students);
   }
 
   return data || [];
@@ -181,6 +219,16 @@ export async function getAttendanceRecords(): Promise<(Attendance & { students: 
 export async function getTodayAttendance(): Promise<(Attendance & { students: Student })[]> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  const students = await getAllStudents();
+
+  if (!supabase) {
+    return getLocalAttendance()
+      .filter(a => new Date(a.check_in_time) >= today)
+      .map(a => ({
+        ...a,
+        students: students.find(s => s.id === a.student_id || s.student_id === a.student_id)!
+      })).filter(a => a.students);
+  }
 
   const { data, error } = await supabase
     .from('attendance')
@@ -189,17 +237,12 @@ export async function getTodayAttendance(): Promise<(Attendance & { students: St
     .order('check_in_time', { ascending: false });
 
   if (error) {
-    console.error('Error fetching today attendance:', error);
-    return [];
-  }
-
-  if (data) {
-    try {
-      const cache = JSON.parse(localStorage.getItem('checkout_cache') || '{}');
-      data.forEach(d => {
-        if (cache[d.id]) Object.assign(d, cache[d.id]);
-      });
-    } catch {}
+    return getLocalAttendance()
+      .filter(a => new Date(a.check_in_time) >= today)
+      .map(a => ({
+        ...a,
+        students: students.find(s => s.id === a.student_id || s.student_id === a.student_id)!
+      })).filter(a => a.students);
   }
 
   return data || [];
@@ -209,77 +252,59 @@ export async function updateStudent(
   id: string,
   updates: Partial<{ student_id: string; name: string; email: string; photo_url: string; face_descriptor: string }>
 ): Promise<boolean> {
+  if (!supabase) {
+    const students = getLocalStudents();
+    const idx = students.findIndex(s => s.id === id);
+    if (idx !== -1) {
+      students[idx] = { ...students[idx], ...updates } as any;
+      saveLocalStudents(students);
+      return true;
+    }
+    return false;
+  }
+
   const { error } = await supabase
     .from('students')
     .update(updates)
     .eq('id', id);
 
-  if (error) {
-    console.error('Error updating student:', error);
-    return false;
-  }
-  return true;
+  return !error;
 }
 
 export async function deleteStudent(id: string): Promise<boolean> {
+  if (!supabase) {
+    const students = getLocalStudents();
+    saveLocalStudents(students.filter(s => s.id !== id));
+    return true;
+  }
+
   const { error } = await supabase
     .from('students')
     .delete()
     .eq('id', id);
 
-  if (error) {
-    console.error('Error deleting student:', error);
-    return false;
-  }
-  return true;
+  return !error;
 }
 
 export async function flushCache(): Promise<boolean> {
-  // First clear attendance records
-  const { error: attendanceError } = await supabase
-    .from('attendance')
-    .delete()
-    .neq('id', '00000000-0000-0000-0000-000000000000'); 
+  localStorage.removeItem('mock_students');
+  localStorage.removeItem('mock_attendance');
+  localStorage.removeItem('checkout_cache');
 
-  if (attendanceError) {
-    console.error('Error flushing attendance logs:', attendanceError);
-    return false;
-  }
-
-  try {
-     localStorage.removeItem('checkout_cache');
-  } catch {}
-
-  // Then clear student registrations
-  const { error: studentsError } = await supabase
-    .from('students')
-    .delete()
-    .neq('id', '00000000-0000-0000-0000-000000000000');
-
-  if (studentsError) {
-    console.error('Error flushing student registry:', studentsError);
-    return false;
+  if (supabase) {
+    await supabase.from('attendance').delete().neq('id', '0');
+    await supabase.from('students').delete().neq('id', '0');
   }
 
   return true;
 }
 
-// Cache whether the 'role' column exists so we don't keep hitting 400
-let roleColumnExists: boolean | null = null;
-
 export async function loginUser(idValue: string, role: string): Promise<Student | null> {
-  // If we already know the column doesn't exist, skip the bad query entirely
-  if (roleColumnExists === false) {
-    const { data, error } = await supabase
-      .from('students')
-      .select('*')
-      .eq('student_id', idValue)
-      .maybeSingle();
-    if (error || !data) return null;
-    return { ...data, role: role as any };
-  }
+  const localUser = getLocalStudents().find(s => s.student_id === idValue && s.role === role);
+  if (localUser) return localUser;
 
-  // Try with role filter first
+  if (!supabase) return null;
+
   const { data, error } = await supabase
     .from('students')
     .select('*')
@@ -287,24 +312,5 @@ export async function loginUser(idValue: string, role: string): Promise<Student 
     .eq('role', role)
     .maybeSingle();
 
-  if (error) {
-    if (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('role')) {
-      // Mark role column as missing so we never hit this path again
-      roleColumnExists = false;
-      // Fallback: search by student_id only
-      const { data: fallbackData, error: fallbackError } = await supabase
-        .from('students')
-        .select('*')
-        .eq('student_id', idValue)
-        .maybeSingle();
-      if (fallbackError || !fallbackData) return null;
-      return { ...fallbackData, role: role as any };
-    }
-    console.error('Login error:', error);
-    return null;
-  }
-
-  // Column exists
-  roleColumnExists = true;
-  return data;
+  return data || null;
 }
