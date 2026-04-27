@@ -1,0 +1,835 @@
+
+================================================================================
+SMART ATTENDANCE SYSTEM - PROJECT DOCUMENT PART 2
+CHAPTERS 3-5: ARCHITECTURE, TECHNOLOGY STACK, FRONTEND
+================================================================================
+
+================================================================================
+CHAPTER 3: SYSTEM ARCHITECTURE
+================================================================================
+
+3.1 HIGH-LEVEL ARCHITECTURE OVERVIEW
+--------------------------------------
+
+The Smart Attendance System is built upon a modern, three-tier web architecture
+that cleanly separates the presentation layer (frontend), the business logic and
+service layer (backend services and API), and the data persistence layer
+(cloud database). This separation ensures that each tier can be scaled, tested,
+and modified independently without disrupting the others.
+
+At the highest level, the architecture can be described as follows:
+
+TIER 1 - PRESENTATION LAYER (React Frontend):
+The user-facing layer is a Single Page Application (SPA) built with React 18
+and TypeScript. The application runs entirely in the browser, providing multiple
+distinct views and portals based on the authenticated user's role. The browser
+accesses the device camera through the WebRTC MediaDevices API, runs the face
+recognition models using TensorFlow.js (WASM backend), and communicates with
+backend services through HTTP REST API calls.
+
+TIER 2 - SERVICE LAYER:
+Two distinct backend services handle non-browser-side logic:
+  (a) Supabase Services: The Supabase platform provides a fully managed
+      PostgreSQL database, automatic REST API generation from the schema,
+      real-time data subscriptions, and built-in authentication. The frontend
+      communicates directly with Supabase through the official JavaScript SDK.
+  (b) Email Server: A lightweight Express.js HTTP server running on port 3001
+      handles email dispatch via Nodemailer and Gmail SMTP. The React frontend
+      sends HTTP POST requests to this server for every email notification event.
+
+TIER 3 - DATA LAYER (Supabase/PostgreSQL):
+All persistent data — student profiles, biometric face descriptors, attendance
+records, and voice audio data — resides in a hosted PostgreSQL database managed
+by Supabase. The database is accessed exclusively through Supabase's PostgREST
+interface, which translates the REST API calls from the frontend into SQL queries
+and enforces Row Level Security (RLS) policies.
+
+HIGH-LEVEL COMPONENT INTERACTION:
+
+  [Student/Admin Browser]
+         |
+         |--- WebRTC Camera API (local, no network)
+         |--- TensorFlow.js WASM (local, no network)
+         |--- Supabase JS SDK ---> [Supabase PostgREST] ---> [PostgreSQL DB]
+         |--- fetch() ---------> [Express Email Server] ---> [Gmail SMTP]
+                                                                    |
+                                                              [Student Email]
+
+3.2 FRONTEND ARCHITECTURE
+--------------------------
+
+The frontend is architected as a React Single Page Application with the following
+structural organization:
+
+COMPONENT HIERARCHY:
+  App.tsx (Root Component)
+  |
+  |-- Login.tsx (Unauthenticated entry point)
+  |
+  |-- [Authenticated Views - role-based rendering]
+      |
+      |-- Dashboard.tsx (Admin/Staff home with statistics)
+      |-- StudentPortal.tsx (Student self-service attendance)
+      |-- AttendanceTerminal.tsx (Kiosk-mode student attendance)
+      |-- AttendanceTracking.tsx (Admin live camera monitoring)
+      |-- StudentRegistration.tsx (New student enrollment)
+      |-- StudentList.tsx (Student directory management)
+      |-- AttendanceHistory.tsx (Historical attendance logs)
+      |-- Settings.tsx (System configuration)
+      |-- Help.tsx (Documentation and help)
+
+STATE MANAGEMENT:
+The application uses React's built-in state management (useState, useRef, useEffect)
+without an external state library. This is appropriate given the application's
+scope. Key state is held at the App.tsx level:
+  - user: The currently authenticated user object (Student type)
+  - currentView: The active navigation view identifier
+
+Component-level state handles:
+  - Camera stream references (useRef for performance)
+  - Face detection processing flags (useRef to avoid stale closures)
+  - UI loading states (useState)
+  - Form field values (useState)
+
+ROUTING:
+Navigation is implemented through conditional rendering controlled by the
+currentView state variable. There is no URL-based routing (React Router is not
+used) because the application is designed to run in full-screen kiosk mode where
+URL manipulation should be prevented.
+
+SERVICE LAYER (Frontend):
+  src/services/
+    database.ts   -- Supabase data access functions
+    emailService.ts -- Email server HTTP client
+    faceDetection.ts -- TensorFlow.js face recognition wrapper
+
+3.3 BACKEND ARCHITECTURE
+--------------------------
+
+The backend architecture consists of two components:
+
+COMPONENT 1: SUPABASE PLATFORM
+Supabase is used as a Backend-as-a-Service (BaaS) platform. It provides:
+
+  PostgreSQL Database: The main data store running on a managed cloud instance.
+  PostgREST API: Automatically generates REST endpoints from the database schema.
+               Every table becomes accessible via standard REST verbs (GET, POST,
+               PATCH, DELETE) at the Supabase project URL.
+  Row Level Security: Database-level security policies that restrict which
+                     records each authenticated user can read or write.
+  JavaScript SDK: The @supabase/supabase-js library provides a typed, promise-based
+                 interface to all Supabase services from the browser.
+
+COMPONENT 2: EXPRESS.JS EMAIL SERVER (email-server/server.cjs)
+A standalone Node.js server built with Express.js handles email dispatch.
+This is necessary because Nodemailer uses Node.js native modules that cannot
+run in a browser environment.
+
+  Server Architecture:
+    - Express.js HTTP server listening on port 3001
+    - CORS middleware allowing cross-origin requests from the React app on port 5173
+    - express.json() body parser for incoming request payloads
+    - Nodemailer createTransport() configured with Gmail SMTP credentials
+    - Single endpoint: POST /send-email
+    - Four HTML email templates (registered, checkin, checkout, absent)
+    - Dotenv configuration reading credentials from the project .env file
+
+  Request Flow:
+    React Frontend  -->  POST http://localhost:3001/send-email  -->  Express Handler
+                                                                        |
+                                                                  Nodemailer
+                                                                        |
+                                                                  Gmail SMTP
+                                                                        |
+                                                                  Student Email
+
+3.4 DATABASE ARCHITECTURE
+--------------------------
+
+The database layer uses PostgreSQL 15 hosted on Supabase's managed cloud
+infrastructure. The schema is organized around two primary domain areas:
+student identity and attendance events.
+
+PRIMARY TABLES:
+  1. students -- Combined user/identity table for all roles
+  2. attendance -- Attendance event records with check-in/out data
+
+SCHEMA DESIGN PHILOSOPHY:
+The schema deliberately uses a single "students" table to store users of all
+roles (student, admin, staff). This simplification is intentional for the initial
+system version and avoids complex join structures for a deployment scenario where
+admin accounts are few and manually managed. The "role" column distinguishes
+between user types for access control logic in the application layer.
+
+3.5 FACE RECOGNITION PIPELINE
+-------------------------------
+
+The face recognition pipeline is the core technical innovation of this system.
+It operates in two phases: enrollment (during registration) and identification
+(during attendance scanning).
+
+ENROLLMENT PHASE (Registration):
+Step 1: Camera Capture
+  - The browser requests camera access via navigator.mediaDevices.getUserMedia()
+  - Multiple frames (minimum 3) are captured as HTML5 Canvas snapshots
+  - Each capture is displayed to the user for visual confirmation
+
+Step 2: Face Detection
+  - Each captured frame is processed by detectSingleFace() from face-api.js
+  - The SSD MobileNet V1 model detects the face bounding box
+  - The 68-point facial landmark model identifies specific facial geometry points
+    including eye corners, nose tip, mouth corners, and jaw outline
+
+Step 3: Face Descriptor Extraction
+  - The FaceRecognitionNet model (ResNet-34 inspired architecture) processes
+    the aligned face crop and outputs a 128-dimensional Float32Array
+  - This "face descriptor" encodes the unique geometric relationships between
+    facial landmarks into a numerical representation
+  - Multiple descriptors from multiple captures are averaged for robustness
+
+Step 4: Storage
+  - The descriptor array is converted to JSON string via JSON.stringify(Array.from(descriptor))
+  - Stored in the face_descriptor column of the students table
+  - The student photo URL is also stored for visual identification in the directory
+
+IDENTIFICATION PHASE (Attendance Scanning):
+Step 1: Continuous Video Scanning
+  - The camera video stream is processed every 400ms via setInterval()
+  - detectAllFaces() (using TinyFaceDetector for speed) finds all faces in frame
+
+Step 2: Descriptor Extraction
+  - For each detected face, the same 128-dimensional descriptor is extracted
+  - The tiny face detector is used here for speed (vs. SSD MobileNet for enrollment)
+
+Step 3: Database Comparison
+  - Pre-loaded student descriptors (loaded once on component mount) are stored
+    in a React useRef for O(1) access without triggering re-renders
+  - For each detected face, Euclidean distance is calculated against every
+    stored student descriptor using the compareFaces() function
+  - The student with the minimum distance is identified as the best match
+
+Step 4: Threshold Decision
+  - If minimum distance <= 0.50: MATCH IDENTIFIED (confidence > 50%)
+  - If minimum distance > 0.50: UNKNOWN FACE
+
+Step 5: Attendance Recording
+  - If match found AND no existing attendance today: Record check-in, send email
+  - If match found AND already checked in but not checked out: Initiate checkout flow
+  - If match found AND both check-in and check-out exist: Display "Already Taken"
+
+FACE DESCRIPTOR MATHEMATICS:
+The Euclidean distance between two 128-dimensional vectors d1 and d2 is:
+
+  distance = sqrt( sum( (d1[i] - d2[i])^2 ) for i in 0..127 )
+
+A distance of 0 indicates identical descriptors (same person, ideal conditions).
+A distance of 0.50 is the empirically determined threshold below which two
+descriptors reliably represent the same person. Values above 0.60 reliably
+indicate different people.
+
+3.6 DATA FLOW DIAGRAM (DFD)
+-----------------------------
+
+LEVEL 0 - CONTEXT DIAGRAM:
+  [Student] --> [Smart Attendance System] --> [Attendance Record]
+  [Admin]   --> [Smart Attendance System] --> [Reports & Monitoring]
+  [System]  --> [Smart Attendance System] --> [Email Notifications]
+
+LEVEL 1 - MAIN PROCESSES:
+
+  Process 1.0: User Authentication
+    Input: Student ID / Staff Credentials
+    Output: Authenticated user session / Access denied
+    Data Store: students table
+
+  Process 2.0: Face Enrollment
+    Input: Webcam frame captures
+    Output: Face descriptor stored in DB
+    Data Store: students table (face_descriptor column)
+
+  Process 3.0: Attendance Recording
+    Input: Real-time video stream + Registered face descriptors
+    Output: Attendance record (check-in/out time)
+    Data Store: attendance table
+
+  Process 4.0: Email Notification
+    Input: Attendance event + Student email
+    Output: Email delivered to student
+    External Agent: Gmail SMTP
+
+  Process 5.0: Admin Monitoring
+    Input: Admin authentication
+    Output: Real-time attendance view, student management
+    Data Store: students table, attendance table
+
+3.7 SEQUENCE DIAGRAMS
+----------------------
+
+SEQUENCE 1: STUDENT CHECK-IN VIA ATTENDANCE TERMINAL
+
+  Student          Terminal UI       face-api.js       Supabase DB       Email Server
+     |                  |                |                  |                  |
+     |-- Enter ID ----> |                |                  |                  |
+     |                  |-- loginUser -->|                  |                  |
+     |                  |               |-- GET /students-->|                  |
+     |                  |               |<-- Student data --|                  |
+     |                  |<- Show card --|                   |                  |
+     |-- Face to cam -> |               |                   |                  |
+     |                  |-- detectFaces()|                  |                  |
+     |                  |<- Descriptors--|                   |                  |
+     |                  |-- compareFaces()|                  |                  |
+     |                  |-- (match < 0.5) |                  |                  |
+     |                  |-- getTodayAttendance() ----------->|                  |
+     |                  |<-- null (no record) ---------------|                  |
+     |                  |-- recordAttendance() ------------->|                  |
+     |                  |<-- attendance record --------------|                  |
+     |                  |-- POST /send-email ----------------|----------------->|
+     |                  |                                    |   sendMail()     |
+     |<- Email received |                                    |<- 200 OK --------|
+     |                  |                                    |                  |
+     |<- "IN VERIFIED"  |                                    |                  |
+
+3.8 MODULE BREAKDOWN
+---------------------
+
+MODULE 1: Authentication Module
+  Files: Login.tsx, database.ts (loginUser function)
+  Responsibility: Handle all login flows for students and admin staff.
+                 Display role-appropriate login UI, validate credentials
+                 against Supabase, manage login state.
+
+MODULE 2: Registration Module
+  Files: StudentRegistration.tsx, database.ts (registerStudent function)
+  Responsibility: Multi-step student enrollment including form data collection,
+                 multi-frame camera capture, face descriptor extraction,
+                 database storage, and confirmation email dispatch.
+
+MODULE 3: Face Recognition Module
+  Files: src/services/faceDetection.ts, @vladmandic/face-api (npm dependency)
+  Responsibility: Model loading and initialization, face detection in video
+                 frames, facial landmark detection, descriptor extraction,
+                 Euclidean distance comparison.
+
+MODULE 4: Attendance Module
+  Files: AttendanceTracking.tsx, AttendanceTerminal.tsx, StudentPortal.tsx,
+         database.ts (recordAttendance, markCheckOut, getTodayStudentAttendance)
+  Responsibility: Continuous video scanning, multi-state attendance logic,
+                 voice recording for checkout, attendance record management.
+
+MODULE 5: Email Notification Module
+  Files: emailService.ts (frontend client), email-server/server.cjs (Node.js server)
+  Responsibility: Translate attendance events into HTTP API calls to the
+                 email server, format and dispatch HTML emails.
+
+MODULE 6: Admin Dashboard Module
+  Files: Dashboard.tsx, AttendanceHistory.tsx, StudentList.tsx
+  Responsibility: Display aggregate attendance statistics, historical logs
+                 with timeline detail, student directory management.
+
+MODULE 7: Database Access Module
+  Files: src/services/database.ts, src/lib/supabase.ts
+  Responsibility: All interaction with Supabase including unauthenticated
+                 read/write operations to students and attendance tables.
+
+================================================================================
+CHAPTER 4: TECHNOLOGY STACK
+================================================================================
+
+4.1 FRONTEND TECHNOLOGIES
+--------------------------
+
+REACT 18.3 (with TypeScript):
+React is a declarative, component-based JavaScript library for building user
+interfaces, developed and maintained by Meta (Facebook). Version 18 introduces
+automatic batching, concurrent rendering features, and the useTransition hook for
+non-blocking state updates. TypeScript integration provides static type checking,
+improved IDE autocompletion, and compile-time error detection that dramatically
+reduces runtime bugs in complex component interactions.
+
+WHY REACT: The component model naturally mirrors the system's modular structure.
+Each attendance portal, dashboard view, and form is a self-contained component
+that can be developed, tested, and reasoned about independently. React's virtual
+DOM ensures UI updates from real-time attendance events are efficient and do not
+cause full page reloads.
+
+VITE 5.4:
+Vite is a next-generation build tool that provides near-instant development
+server startup using native ES modules (no bundling during development) and
+Rollup-based optimized production builds. For a project that iteratively develops
+real-time camera components, Vite's hot module replacement (HMR) is essential —
+changes to component code are reflected in the browser without losing camera
+state or reloading face recognition models.
+
+TAILWINDCSS 3.4:
+Tailwind is a utility-first CSS framework that allows styling through composable
+utility classes directly in JSX markup. This approach eliminates the overhead of
+maintaining separate CSS files for complex, state-driven UI components. The premium
+glassmorphism design of the student and admin portals — with backdrop-blur,
+gradient backgrounds, and animated scan lines — is implemented efficiently through
+Tailwind's responsive utility classes.
+
+LUCIDE-REACT 0.344:
+A comprehensive icon library providing over 1,000 consistent, accessible SVG
+icons as React components. Used throughout the UI for visual communication:
+ShieldCheck for verified attendance, VideoOff for camera controls, UserPlus for
+registration, Mail for email notifications, and dozens more.
+
+4.2 BACKEND TECHNOLOGIES
+-------------------------
+
+NODE.JS 18+ (LTS):
+Node.js is the JavaScript runtime environment powering the email server. Its
+non-blocking, I/O-driven architecture makes it ideal for a lightweight HTTP
+server handling asynchronous email dispatch operations. Node.js 18 LTS provides
+the stability expected for production server infrastructure.
+
+EXPRESS.JS 4.x:
+Express is the most widely used web application framework for Node.js. Used in
+the email server for routing, JSON body parsing, and CORS middleware. Its minimal
+footprint and extensive middleware ecosystem make it appropriate for this
+single-endpoint service.
+
+NODEMAILER 6.x:
+Nodemailer is the de facto standard library for sending emails from Node.js
+applications. It supports Gmail SMTP with OAuth2 and App Password authentication,
+rich HTML email content, attachments, and carbon copies. In this system, it is
+configured with a dedicated Gmail account (smartattendance2027@gmail.com) using
+a Google App Password for secure SMTP authentication.
+
+DOTENV 16.x:
+Manages environment-specific configuration through .env files, separating
+sensitive credentials (Supabase keys, Gmail credentials) from source code.
+
+4.3 AI AND FACE RECOGNITION LIBRARIES
+---------------------------------------
+
+@VLADMANDIC/FACE-API 1.7.15:
+This library is a heavily optimized fork of the original face-api.js by Vincent
+Mühler, maintained by Vladimir Mandic. It implements the following deep learning
+models optimized for browser execution:
+
+  (a) SSD MobileNet V1: Single Shot MultiBox Detector adapted for face detection.
+      A convolutional neural network that produces bounding boxes and confidence
+      scores for all detected faces in a single forward pass. Used during student
+      enrollment for high-accuracy face detection.
+
+  (b) Tiny Face Detector: A lightweight, YOLO-inspired convolutional architecture
+      optimized for real-time face detection at the cost of slightly reduced
+      accuracy. This architecture directly reflects the YOLO paradigm of treating
+      detection as a single regression problem across a spatial grid. Used during
+      the attendance scanning loop for real-time performance at 400ms intervals.
+
+  (c) Face Landmark Detection (68 points): A CNN that takes the cropped face
+      region and outputs 68 (x,y) coordinate pairs corresponding to specific
+      anatomical facial landmarks (eye corners, eyebrow outlines, nose bridge,
+      nostril positions, lip borders, jaw outline).
+
+  (d) Face Recognition Net (ResNet-34 based): Takes the normalized, aligned
+      face patch (aligned using the 68 landmark positions) and produces a
+      128-dimensional floating-point descriptor vector. This architecture is
+      inspired by Google's FaceNet and produces descriptor embeddings where
+      faces of the same person cluster together in the 128-dimensional space.
+
+@TENSORFLOW/TFJS 4.22:
+TensorFlow.js is Google's JavaScript ML framework that allows trained neural
+network models to run in-browser. The WASM (WebAssembly) backend is used in
+this system to achieve near-native computational performance for the matrix
+operations underlying face detection and recognition.
+
+WHY BROWSER-SIDE AI:
+Processing face recognition in the browser rather than on a server provides:
+  - ZERO LATENCY: No round-trip to a remote server for each video frame
+  - PRIVACY: Raw video frames and face descriptors never leave the user's device
+  - OFFLINE CAPABLE: Recognition works even if internet connection is slow
+  - COST: No GPU server rental fees
+
+4.4 DATABASE AND CLOUD SERVICES
+---------------------------------
+
+SUPABASE:
+Supabase is an open-source Firebase alternative providing a hosted PostgreSQL
+database with an automatically generated REST API, real-time WebSocket
+subscriptions, authentication services, and an intuitive web dashboard.
+
+  PostgreSQL 15: The underlying database engine, providing ACID transactions,
+                sophisticated indexing, full-text search, and JSON support.
+  PostgREST: A standalone web server that turns a PostgreSQL database schema
+             directly into a RESTful API, allowing the React frontend to perform
+             all CRUD operations through HTTP.
+  Row Level Security: Database-level authorization policies that can restrict
+                     which rows each user can access.
+
+@SUPABASE/SUPABASE-JS 2.57:
+The official JavaScript/TypeScript client for Supabase. Provides:
+  - Typed wrappers around all REST API operations
+  - Real-time subscription support
+  - Authentication state management
+  - Automatic JWT token management
+
+4.5 COMMUNICATION AND NOTIFICATION SERVICES
+---------------------------------------------
+
+GMAIL SMTP:
+Google's SMTP servers (smtp.gmail.com, port 587 with STARTTLS) are used for
+email delivery. Authentication uses Gmail App Passwords — application-specific
+passwords that bypass Google's two-factor authentication for programmatic access
+while maintaining account security. The dedicated Gmail account
+smartattendance2027@gmail.com serves as the system notification sender.
+
+4.6 DEVELOPMENT TOOLS
+----------------------
+
+VISUAL STUDIO CODE: Primary code editor with TypeScript language server,
+                    ESLint integration, and Vite plugin support.
+NPM 10.x: Package management and script execution.
+SUPABASE DASHBOARD: Web-based database administration for schema inspection,
+                    table browsing, and SQL query execution.
+CHROME DEVTOOLS: Browser debugging, network inspection, and WebRTC camera
+                 stream testing.
+GIT: Version control (project maintained in local git repository).
+
+================================================================================
+CHAPTER 5: FRONTEND DEVELOPMENT
+================================================================================
+
+5.1 UI/UX DESIGN PRINCIPLES
+-----------------------------
+
+The user interface of the Smart Attendance System is designed according to modern
+web design principles with a strong emphasis on premium aesthetics, accessibility,
+and operational clarity. The target users range from first-year students unfamiliar
+with technology to administrative staff managing daily operations.
+
+GLASSMORPHISM DESIGN LANGUAGE:
+The primary aesthetic is glassmorphism — a design trend characterized by:
+  - Semi-transparent panels with backdrop-filter: blur() applied
+  - Subtle border highlights on the lighter side of surfaces
+  - Deep, rich background gradients (navy to slate to indigo)
+  - Floating card elements with significant drop shadows
+  - Text with strong contrast against blurred backgrounds
+
+This aesthetic communicates a sense of technological sophistication appropriate
+for a biometric security system and creates immediate positive first impressions.
+
+COLOR PALETTE:
+  Primary: #2563eb (Blue-600) — Trust, technology, security
+  Success: #059669 (Emerald-600) — Verification confirmed, present
+  Error: #dc2626 (Red-600) — Verification failed, unauthorized
+  Warning: #d97706 (Amber-600) — Absence alerts, warnings
+  Background: Gradient from #0f172a to #1e3a8a — Deep professional dark
+  Text Primary: #f8fafc — Near-white for dark backgrounds
+  Text Secondary: rgba(255,255,255,0.6) — Subdued secondary information
+
+TYPOGRAPHY:
+  The Inter font family (via browser system font stack with 'Segoe UI' fallback)
+  is used exclusively. Inter was designed by Rasmus Andersson specifically for
+  screen readability with excellent legibility at all sizes from 8px to 72px.
+  Font weights range from regular (400) for body text to black (900) for
+  status notifications and headings.
+
+MOTION AND ANIMATION:
+  CSS animations provide visual feedback without JavaScript overhead:
+  - animate-scan-line: A horizontal line scanning down the camera feed
+    simulating active biometric scanning (communicates system activity)
+  - animate-pulse: Applied to active indicators (camera on, processing)
+  - animate-spin: Loading spinners for async operations
+  - slide-in-from-bottom: Entry animations for status notification cards
+  - animate-bounce: Attention-grabbing bounce on attendance confirmation notifications
+  - animate-ping: Ripple effect on status indicator dots in calendar/log views
+
+RESPONSIVE DESIGN:
+  The layout uses CSS Grid and Flexbox through Tailwind's responsive prefixes:
+  - Mobile (<768px): Single column, stacked layout
+  - Tablet (768-1024px): Two-column main layouts
+  - Desktop (>1024px): Three-column with sidebar navigation
+  The primary use case is desktop/tablet as this is an institutional kiosk system.
+
+ACCESSIBILITY:
+  - All interactive elements have visible focus states
+  - Status messages use both color AND iconography (not color alone)
+  - ARIA labels on icon-only buttons
+  - Sufficient color contrast ratios (WCAG AA minimum)
+
+5.2 LOGIN PAGE (Login.tsx)
+---------------------------
+
+The Login page serves as the secure entry point for all system users. It presents
+a two-panel layout optimized for desktop display:
+
+LEFT PANEL (Branding/Information):
+  - Dark gradient background (indigo to navy)
+  - System name "Smart Attendance System" in large, bold white typography
+  - Three feature highlights with icons:
+      "Biometric Identity Verification" (Fingerprint icon)
+      "Military-Grade Encryption" (ShieldCheck icon)
+      "Real-Time Attendance Analytics" (Activity icon)
+  - Decorative animated elements (pulsing circles, gradient overlays)
+  - Communicates the system's premium, security-focused identity before login
+
+RIGHT PANEL (Login Form):
+  - White card with subtle shadows on dark background
+  - Role selector: Toggle buttons for "Student Portal" vs "College Admin"
+  - Input field: "Enter your Student ID" / "Enter Staff ID"
+  - Login button with loading state animation during authentication
+  - Error message display in red banner on invalid credentials
+
+ROLE SELECTION LOGIC:
+  The role selector changes the input placeholder text and routes the login
+  attempt to the appropriate authentication logic in loginUser(). For admin,
+  the special credential "annamalaiyar@2026" bypasses the database lookup (for
+  the primary admin account) or creates/retrieves the admin record on first login.
+
+AUTHENTICATION FLOW:
+  1. User selects role (student/staff) from toggle buttons
+  2. User enters their ID in the text field
+  3. On form submit, handleLogin() is called
+  4. For staff with ID "annamalaiyar@2026": handleDemoLogin() creates/retrieves
+     admin account from database
+  5. For all other IDs: loginUser(idValue, role) is called
+  6. If user returned: onLogin(user) updates App.tsx state -> navigates to dashboard
+  7. If null returned: Error message displayed below input field
+
+EXAMPLE CODE SNIPPET - Login Form:
+  <form onSubmit={handleLogin}>
+    <div className="role-toggle">
+      <button onClick={() => setRole('student')}>Student Portal</button>
+      <button onClick={() => setRole('staff')}>College Admin</button>
+    </div>
+    <input
+      type="text"
+      placeholder={role === 'student' ? "Enter Student ID" : "Enter Staff ID"}
+      value={idValue}
+      onChange={e => setIdValue(e.target.value)}
+    />
+    {error && <div className="error-banner">{error}</div>}
+    <button type="submit" disabled={isLoading}>
+      {isLoading ? <Loader2 className="spin" /> : 'Login'}
+    </button>
+  </form>
+
+5.3 STUDENT REGISTRATION PORTAL (StudentRegistration.tsx)
+----------------------------------------------------------
+
+The registration portal is a multi-step wizard that guides administrators through
+enrolling new students into the biometric database.
+
+STEP 1: BASIC INFORMATION FORM
+  Fields collected:
+  - Student ID: Unique institutional identifier (format validation applied)
+  - Full Name: Student's complete legal name
+  - Email Address: Required for notification delivery
+  - Department: Academic department (Computer Science, Electrical, etc.)
+  - Mobile Number: Emergency contact
+  - Date of Birth: For identity verification
+  - Tutor Name: Academic mentor assignment
+
+  Validation Rules:
+  - Student ID must be unique in the database (checked via pre-existing records)
+  - Email must match RFC 5322 format (HTML5 type="email" validation)
+  - Name must contain at least 3 characters
+  - Department must be provided for meaningful attendance department filtering
+
+STEP 2: BIOMETRIC FACE CAPTURE
+  The biometric capture step is the most technically complex part of registration.
+  
+  Camera Initialization:
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })
+  returns a MediaStream that is displayed in a <video> element.
+  
+  Capture Process (3 frames required):
+  - User positions face within the circular guide overlay
+  - System runs detectSingleFace() on the live video frame
+  - If face detected with sufficient quality: snapshot extracted to Canvas
+  - Snapshot displayed in capture gallery row below video
+  - Process repeated for 3 captures with slight head movements for variety
+  
+  Descriptor Averaging:
+  Three 128-dimensional descriptor vectors are extracted from the three captures.
+  The final stored descriptor is the mathematical average of the three vectors,
+  providing a more robust representation than any single capture.
+  
+  Pseudo-code:
+    captures = []
+    FOR each capture attempt:
+      frame = drawVideoFrameToCanvas()
+      detection = await detectSingleFace(frame).withFaceLandmarks().withFaceDescriptor()
+      IF detection found:
+        captures.append(detection.descriptor)
+        snapshots.append(canvas.toDataURL())
+    
+    IF len(captures) >= 3:
+      finalDescriptor = average(captures)  // element-wise mean of Float32Arrays
+      photoUrl = snapshots[0]  // first capture as profile photo
+      PROCEED to step 3
+
+STEP 3: CONFIRMATION AND STORAGE
+  - Summary card displayed with all entered information
+  - Photo preview of the student
+  - "Complete Registration" button
+  - On confirmation:
+      registerStudent() called with all form data + descriptor + photoUrl
+      Record inserted into students table in Supabase
+      Registration confirmation email dispatched via Nodemailer
+      Success message displayed, form reset after 2 seconds
+
+DUPLICATE FACE DETECTION:
+  Before allowing registration, the system checks for twin/similar face conflicts
+  by comparing the new student's descriptor against all existing registered
+  students. If any existing student has a distance < 0.40 (very high similarity),
+  a warning is displayed to the administrator indicating potential duplicate
+  or twin student scenario requiring manual verification.
+
+5.4 STUDENT PORTAL (StudentPortal.tsx)
+----------------------------------------
+
+The Student Portal is the self-service attendance interface for students who are
+already logged in with their credentials. Unlike the terminal (which is public-facing),
+the portal knows the student's identity from the login session.
+
+PORTAL FLOW:
+  1. Student logs in with their Student ID
+  2. Portal displays their identity card (photo, name, department, ID)
+  3. After 3 seconds, automatically transitions to camera scanning step
+  4. Camera activates and face detection begins
+  5. Student looks at camera; system detects and matches their face
+  6. On successful match (distance < 0.50):
+     - First visit today: Records check-in, shows "ATTENDANCE IN VERIFIED"
+     - Already checked in: Shows voice reason step for check-out
+     - Already checked out: Shows "ALREADY ATTENDANCE TAKEN"
+  7. On failed match (distance >= 0.50 for 3 consecutive attempts):
+     - Shows "FACE NOT IN DATABASE (NO DATA FOUND)"
+     - Sends security alert email to registered address
+     - Automatically logs out after 3 seconds
+
+THREE-RETRY SECURITY MECHANISM:
+  failCountRef tracks consecutive failed verifications.
+  On first and second failure: Shows retry message, resets after 1.5 seconds.
+  On third failure: Triggers security alert, sends email, forces logout.
+  This prevents unauthorized persons from attempting to game the system.
+
+5.5 ATTENDANCE TERMINAL (AttendanceTerminal.tsx)
+-------------------------------------------------
+
+The terminal is designed for shared-workstation/kiosk deployment where students
+approach a public attendance station and enter their ID manually (since no
+pre-authentication has occurred).
+
+TERMINAL FLOW:
+  1. Student enters their Student ID at the ID entry screen
+  2. System validates ID against database via loginUser()
+  3. If valid: displays student identity card (same as portal step 2)
+  4. After 3 seconds: camera activates
+  5. System attempts face verification against student's stored descriptor
+  6. On match: Same three-state attendance logic as portal
+  7. On failure: "Face not found" error displayed for 10 seconds, then resets
+
+KIOSK-APPROPRIATE DESIGN:
+  - Large, touch-friendly buttons
+  - Minimal navigation (only the attendance flow, no other system access)
+  - Auto-reset behavior: returns to ID entry after every attendance event
+  - Clear, high-contrast status messages readable from arm's length
+
+5.6 ATTENDANCE TRACKING - LIVE ADMIN CAMERA (AttendanceTracking.tsx)
+----------------------------------------------------------------------
+
+This component is exclusively for administrative use. It provides a persistent
+camera feed that automatically detects and records attendance for all students
+who enter the camera's field of view simultaneously.
+
+MULTI-FACE DETECTION:
+  Unlike the student portal (single-face), the tracking view uses detectAllFaces()
+  to process all faces present in the frame simultaneously. Each detected face
+  is matched against the full student database. This allows a single camera
+  at a classroom or corridor entrance to capture attendance for groups.
+
+CANVAS OVERLAY:
+  A transparent <canvas> element overlaid on the <video> element displays
+  real-time bounding boxes around detected faces with color-coded status:
+  - Green box + "VERIFIED" label: Successfully matched and attendance recorded
+  - Amber box + "RECORDED" label: Student already has attendance today
+  - Red box + "UNKNOWN" label: Face detected but not in database
+
+  The drawOnCanvas() function renders these overlays using Canvas 2D API:
+    ctx.strokeStyle = colorByType
+    ctx.strokeRect(x, y, width, height)
+    ctx.fillStyle = colorByType
+    ctx.fillText(studentName, x, y)
+
+TODAY'S LOG SIDEBAR:
+  A scrollable panel displays real-time entries for today's attendance events.
+  Each entry shows:
+  - Student name and ID
+  - Check-in time (green badge)
+  - Check-out time if available (green or red badge for emergency exit)
+  - Play button for voice reason audio if exit_reason is stored
+
+5.7 ADMIN DASHBOARD (Dashboard.tsx)
+-------------------------------------
+
+The admin dashboard is the home view for authenticated admin/staff users.
+It provides aggregate statistics and quick-access cards:
+
+STATISTICS CARDS:
+  - Total Students Registered (count query on students table)
+  - Today's Attendance Count (count of today's attendance records)
+  - Attendance Rate % (today's count / total students * 100)
+  - Currently On Campus (count with check_in but no check_out today)
+
+RECENT ACTIVITY FEED:
+  Last 5 attendance events displayed chronologically with student photo,
+  name, time, and status (Present/Out/Emergency).
+
+QUICK ACTIONS:
+  Navigation shortcuts to Registration, Tracking, History, and Directory.
+
+5.8 STUDENT DIRECTORY (StudentList.tsx)
+----------------------------------------
+
+The Student Directory displays all registered students in a searchable,
+sortable table format.
+
+TABLE COLUMNS:
+  - Student (photo thumbnail + name + "Face Registered" indicator)
+  - Student ID (monospace font for readability)
+  - Email (with mail icon)
+  - Department / Contact (two-line cell with department and mobile number)
+  - Registered Date
+
+FILTERING:
+  The search input filters the displayed records in real-time by both
+  student name and student ID via JavaScript .filter() on the loaded data.
+
+ADMIN ACTIONS (per student row):
+  - Edit Metadata: Opens a modal to update student ID, name, or email
+  - Revoke Access: Deletes the student record from the database (with confirmation)
+
+DATA FILTERING POLICY:
+  The component automatically excludes admin and staff accounts from the
+  displayed list, showing only genuine student enrollments.
+  Implementation: data.filter(s => s.student_id !== 'annamalaiyar@2026' && s.role !== 'admin' && s.role !== 'staff')
+
+5.9 ATTENDANCE HISTORY (AttendanceHistory.tsx)
+----------------------------------------------
+
+Provides comprehensive historical attendance records with full timeline data.
+
+FEATURES:
+  - Date range filtering (from date / to date pickers)
+  - Student name search
+  - Status filtering (Present, Out, Emergency)
+  - Sortable columns
+  - Per-record voice audio playback button (if exit reason recorded)
+  - Export capability to CSV format
+
+RECORD DISPLAY:
+  Each record shows:
+  - Student photo + name + ID
+  - Check-in timestamp (formatted as DD/MM/YYYY HH:MM:SS)
+  - Check-out timestamp (or "Still on campus" if not yet checked out)
+  - Duration on campus (calculated from in/out timestamps)
+  - Exit type (Normal / Early Exit / Emergency)
+  - Voice reason playback (Audio icon button)
+
+================================================================================
+END OF PART 2 - CHAPTERS 3-5
+================================================================================
